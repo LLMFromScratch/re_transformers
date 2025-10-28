@@ -19,7 +19,7 @@ class AlbertAttention(nn.Module):
                 f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
                 f"heads ({config.num_attention_heads}"
             )
-        
+
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
         self.attention_head_size = config.hidden_size // config.num_attention_heads
@@ -61,7 +61,7 @@ class AlbertAttention(nn.Module):
 
         if attention_mask is not None:
             attention_scores = attention_scores + attention_mask
-        
+
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
             position_ids_l = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(-1, 1)
             position_ids_r = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(1, -1)
@@ -107,7 +107,7 @@ class AlbertLayer(nn.Module):
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
 
-        self.attention = ALBERT_ATTENTION_CLASSES[config._attn_implementation](config)  #type: ignore
+        self.attention = ALBERT_ATTENTION_CLASSES[config._attn_implementation](config)  # type: ignore
         self.ffn = nn.Linear(config.hidden_size, config.intermediate_size)
         self.ffn_output = nn.Linear(config.intermediate_size, config.hidden_size)
         self.activation = ACT2FN[config.hidden_act]
@@ -230,7 +230,7 @@ class AlbertTransformer(nn.Module):
             if output_attentions:
                 all_attentions = all_attentions + layer_group_output[-1]
             if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states, )  # type: ignore  # noqa: E501
+                all_hidden_states = all_hidden_states + (hidden_states, )  # type: ignore
 
         if not return_dict:
             return tuple(
