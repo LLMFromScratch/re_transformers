@@ -3,6 +3,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.pytorch_utils import apply_chunking_to_forward
 
@@ -77,7 +78,7 @@ class AlbertAttention(nn.Module):
                 relative_position_scores_key = torch.einsum("bhrd,lrd->bhlr", key_layer, positional_embedding)
                 attention_scores = attention_scores + relative_position_scores_query + relative_position_scores_key
 
-        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+        attention_probs = F.softmax(attention_scores, dim=-1)
         attention_probs = self.attention_dropout(attention_probs)
 
         if head_mask is not None:
@@ -91,6 +92,50 @@ class AlbertAttention(nn.Module):
         layernormed_context_layer = self.LayerNorm(projected_context_layer_dropout + hidden_states)
 
         return (layernormed_context_layer, attention_probs) if output_attentions else (layernormed_context_layer, )
+
+
+class AlbertSdpaAttention(AlbertAttention):
+    def __init__(self, config: AlbertConfig) -> None:
+        super().__init__(config)
+
+        self.dropout_prob = config.attention_probs_dropout_prob
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        output_attentions: bool = False,
+    ) -> Union[Tuple[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+        if self.position_embedding_type != "absolute" or output_attentions:
+            return super().forward(hidden_states, attention_mask, head_mask, output_attentions)
+
+        batch_size, seq_len, _ = hidden_states.shape
+
+        query_layer: torch.Tensor = self.query(hidden_states)
+        key_layer: torch.Tensor = self.key(hidden_states)
+        value_layer: torch.Tensor = self.value(hidden_states)
+
+        query_layer = query_layer.view(batch_size, seq_len, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+        key_layer = key_layer.view(batch_size, seq_len, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+        value_layer = value_layer.view(batch_size, seq_len, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+
+        attention_output = F.scaled_dot_product_attention(
+            query_layer,
+            key_layer,
+            value_layer,
+            attention_mask,
+            self.dropout_prob if self.training else 0.0,
+            is_causal=False,
+        )
+
+        attention_output = attention_output.transpose(1, 2).flatten(2)
+
+        projected_context_layer = self.dense(attention_output)
+        projected_context_layer_dropout = self.output_dropout(projected_context_layer)
+        layernormed_context_layer = self.LayerNorm(hidden_states + projected_context_layer_dropout)
+
+        return (layernormed_context_layer, )
 
 
 ALBERT_ATTENTION_CLASSES = {
