@@ -11,6 +11,11 @@ from .configuration_albert import AlbertConfig
 from ...modeling_outputs import BaseModelOutput
 
 
+class AlbertEmbeddings(nn.Module):
+    def __init__(self, config: AlbertConfig) -> None:
+        super().__init__()
+
+
 class AlbertAttention(nn.Module):
     def __init__(self, config: AlbertConfig) -> None:
         super().__init__()
@@ -293,3 +298,4 @@ class AlbertTransformer(nn.Module):
 # Questions
 # 1. `head_mask`
 # 2. `position_embedding_type`
+# 3. Why are `position_embeddings` and `token_type_embeddings` not padded?
