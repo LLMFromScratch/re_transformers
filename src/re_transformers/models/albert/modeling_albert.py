@@ -297,5 +297,4 @@ class AlbertTransformer(nn.Module):
 
 # Questions
 # 1. `head_mask`
-# 2. `position_embedding_type`
-# 3. Why are `position_embeddings` and `token_type_embeddings` not padded?
+# 2. `past_key_value_length`
