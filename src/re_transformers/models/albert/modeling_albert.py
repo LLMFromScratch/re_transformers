@@ -1,14 +1,149 @@
 import math
+import os
+from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
-from transformers.pytorch_utils import apply_chunking_to_forward
+from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa
+from transformers.modeling_outputs import BaseModelOutputWithPooling
+from transformers.modeling_utils import PreTrainedModel
+from transformers.pytorch_utils import apply_chunking_to_forward, find_pruneable_heads_and_indices, prune_linear_layer
+from transformers.utils import ModelOutput, auto_docstring, logging
 
 from .configuration_albert import AlbertConfig
 from ...modeling_outputs import BaseModelOutput
+
+
+logger = logging.get_logger(__name__)
+
+
+def load_tf_weights_in_albert(model, config, tf_checkpoint_path):
+    """Load tf checkpoints in a pytorch model."""
+    try:
+        import re
+
+        import numpy as np
+        import tensorflow as tf
+    except ImportError:
+        logger.error(
+            "Loading a TensorFlow model in PyTorch, requires TensorFlow to be installed. Please see "
+            "https://www.tensorflow.org/install/ for installation instructions."
+        )
+        raise
+    tf_path = os.path.abspath(tf_checkpoint_path)
+    logger.info(f"Converting TensorFlow checkpoint from {tf_path}")
+    # Load weights from TF model
+    init_vars = tf.train.list_variables(tf_path)
+    names = []
+    arrays = []
+    for name, shape in init_vars:
+        logger.info(f"Loading TF weight {name} with shape {shape}")
+        array = tf.train.load_variable(tf_path, name)
+        names.append(name)
+        arrays.append(array)
+
+    for name, array in zip(names, arrays):
+        print(name)
+
+    for name, array in zip(names, arrays):
+        original_name = name
+
+        # If saved from the TF HUB module
+        name = name.replace("module/", "")
+
+        # Renaming and simplifying
+        name = name.replace("ffn_1", "ffn")
+        name = name.replace("bert/", "albert/")
+        name = name.replace("attention_1", "attention")
+        name = name.replace("transform/", "")
+        name = name.replace("LayerNorm_1", "full_layer_layer_norm")
+        name = name.replace("LayerNorm", "attention/LayerNorm")
+        name = name.replace("transformer/", "")
+
+        # The feed forward layer had an 'intermediate' step which has been abstracted away
+        name = name.replace("intermediate/dense/", "")
+        name = name.replace("ffn/intermediate/output/dense/", "ffn_output/")
+
+        # ALBERT attention was split between self and output which have been abstracted away
+        name = name.replace("/output/", "/")
+        name = name.replace("/self/", "/")
+
+        # The pooler is a linear layer
+        name = name.replace("pooler/dense", "pooler")
+
+        # The classifier was simplified to predictions from cls/predictions
+        name = name.replace("cls/predictions", "predictions")
+        name = name.replace("predictions/attention", "predictions")
+
+        # Naming was changed to be more explicit
+        name = name.replace("embeddings/attention", "embeddings")
+        name = name.replace("inner_group_", "albert_layers/")
+        name = name.replace("group_", "albert_layer_groups/")
+
+        # Classifier
+        if len(name.split("/")) == 1 and ("output_bias" in name or "output_weights" in name):
+            name = "classifier/" + name
+
+        # No ALBERT model currently handles the next sentence prediction task
+        if "seq_relationship" in name:
+            name = name.replace("seq_relationship/output_", "sop_classifier/classifier/")
+            name = name.replace("weights", "weight")
+
+        name = name.split("/")
+
+        # Ignore the gradients applied by the LAMB/ADAM optimizers.
+        if (
+            "adam_m" in name
+            or "adam_v" in name
+            or "AdamWeightDecayOptimizer" in name
+            or "AdamWeightDecayOptimizer_1" in name
+            or "global_step" in name
+        ):
+            logger.info(f"Skipping {'/'.join(name)}")
+            continue
+
+        pointer = model
+        for m_name in name:
+            if re.fullmatch(r"[A-Za-z]+_\d+", m_name):
+                scope_names = re.split(r"_(\d+)", m_name)
+            else:
+                scope_names = [m_name]
+
+            if scope_names[0] == "kernel" or scope_names[0] == "gamma":
+                pointer = getattr(pointer, "weight")
+            elif scope_names[0] == "output_bias" or scope_names[0] == "beta":
+                pointer = getattr(pointer, "bias")
+            elif scope_names[0] == "output_weights":
+                pointer = getattr(pointer, "weight")
+            elif scope_names[0] == "squad":
+                pointer = getattr(pointer, "classifier")
+            else:
+                try:
+                    pointer = getattr(pointer, scope_names[0])
+                except AttributeError:
+                    logger.info(f"Skipping {'/'.join(name)}")
+                    continue
+            if len(scope_names) >= 2:
+                num = int(scope_names[1])
+                pointer = pointer[num]
+
+        if m_name[-11:] == "_embeddings":
+            pointer = getattr(pointer, "weight")
+        elif m_name == "kernel":
+            array = np.transpose(array)
+        try:
+            if pointer.shape != array.shape:
+                raise ValueError(f"Pointer shape {pointer.shape} and array shape {array.shape} mismatched")
+        except ValueError as e:
+            e.args += (pointer.shape, array.shape)
+            raise
+        print(f"Initialize PyTorch weight {name} from {original_name}")
+        pointer.data = torch.from_numpy(array)
+
+    return model
 
 
 class AlbertEmbeddings(nn.Module):
@@ -87,6 +222,20 @@ class AlbertAttention(nn.Module):
             self.distance_embedding = nn.Embedding(2 * self.max_position_embeddings - 1, self.attention_head_size)
 
         self.pruned_heads = set()
+
+    def prune_heads(self, heads: list[int]) -> None:
+        if len(heads) == 0:
+            return
+
+        heads, index = find_pruneable_heads_and_indices(heads, self.num_attention_heads, self.attention_head_size, self.pruned_heads)
+        self.query = prune_linear_layer(self.query, index)
+        self.key = prune_linear_layer(self.key, index)
+        self.value = prune_linear_layer(self.value, index)
+        self.dense = prune_linear_layer(self.dense, index, dim=1)
+
+        self.num_attention_heads -= len(heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+        self.pruned_heads.union(heads)
 
     def forward(
         self,
@@ -338,6 +487,258 @@ class AlbertTransformer(nn.Module):
             )
 
 
+class AlbertMLMHead(nn.Module):
+    def __init__(self, config: AlbertConfig):
+        super().__init__()
+
+        self.dense = nn.Linear(config.hidden_size, config.embedding_size)
+        self.activation = ACT2FN[config.hidden_act]
+        self.LayerNorm = nn.LayerNorm(config.embedding_size, eps=config.layer_norm_eps)
+        self.decoder = nn.Linear(config.embedding_size, config.vocab_size)
+        self.bias = nn.Parameter(torch.zeros(config.vocab_size))
+        self.decoder.bias = self.bias
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.activation(hidden_states)
+        hidden_states = self.LayerNorm(hidden_states)
+        hidden_states = self.decoder(hidden_states)
+        return hidden_states
+
+    def _tie_weights(self) -> None:
+        if self.decoder.bias.device.type == "meta":
+            self.decoder.bias = self.bias
+        else:
+            self.bias = self.decoder.bias
+
+
+class AlbertSOPHead(nn.Module):
+    def __init__(self, config: AlbertConfig):
+        super().__init__()
+
+        self.dropout = nn.Dropout(config.classifier_dropout_prob)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+
+    def forward(self, pooled_output: torch.Tensor) -> torch.Tensor:
+        dropout_pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(dropout_pooled_output)
+        return logits
+
+
+@auto_docstring
+class AlbertPreTrainedModel(PreTrainedModel):
+    config: AlbertConfig
+    load_tf_weights = load_tf_weights_in_albert
+    base_model_prefix = "albert"
+    _supports_sdpa = True
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.weight.data.fill_(1.0)
+            module.bias.data.zero_()
+        elif isinstance(module, AlbertMLMHead):
+            module.bias.data.zero_()
+
+
+class AlbertModel(AlbertPreTrainedModel):
+    config: AlbertConfig
+    base_model_prefix = "albert"
+
+    def __init__(self, config: AlbertConfig, add_pooling_layer: bool = True):
+        super().__init__(config)
+
+        self.config = config
+        self.attn_implementation = config._attn_implementation
+        self.position_embedding_type = config.position_embedding_type
+
+        self.embeddings = AlbertEmbeddings(config)
+        self.encoder = AlbertTransformer(config)
+        self.pooler = nn.Linear(config.hidden_size, config.hidden_size) if add_pooling_layer else None
+        self.pooler_activation = nn.Tanh() if add_pooling_layer else None
+
+        self.post_init()
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embeddings.word_embeddings
+
+    def set_input_embeddings(self, value: nn.Embedding) -> None:
+        self.embeddings.word_embeddings = value
+
+    def prune_heads(self, heads_to_prune: dict[int, list[int]]):
+        for layer, heads in heads_to_prune.items():
+            group_idx = int(layer / self.config.inner_group_num)
+            inner_group_idx = int(layer - group_idx * self.config.inner_group_num)
+            self.encoder.albert_layer_groups[group_idx].albert_layers[inner_group_idx].attention.prune_heads(heads)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[BaseModelOutputWithPooling, tuple]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
+            input_shape = input_ids.size()
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.size()[:-1]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+        _, seq_length = input_shape
+
+        embedding_output = self.embeddings(input_ids, position_ids, token_type_ids, inputs_embeds)
+
+        if attention_mask is None:
+            attention_mask = torch.ones(input_shape, dtype=self.dtype, device=self.device)
+
+        use_sdpa_attention_mask = (
+            self.attn_implementation == "sdpa"
+            and self.position_embedding_type == "absolute"
+            and head_mask is None
+            and not output_attentions
+        )
+        if use_sdpa_attention_mask:
+            extended_attention_mask = _prepare_4d_attention_mask_for_sdpa(attention_mask, self.dtype, seq_length)
+        else:
+            extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            extended_attention_mask = (1.0 - extended_attention_mask) * torch.info(self.dtype).min
+
+        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+
+        encoder_outputs = self.encoder(
+            embedding_output,
+            extended_attention_mask,
+            head_mask,
+            output_attentions,
+            output_hidden_states,
+            return_dict,
+        )
+
+        sequence_output = encoder_outputs[0]
+        pooled_output = self.pooler_activation(self.pooler(sequence_output[:, 0])) if self.pooler is not None else None
+
+        if not return_dict:
+            return (sequence_output, pooled_output) + encoder_outputs[1:]
+        else:
+            return BaseModelOutputWithPooling(
+                last_hidden_state=sequence_output,
+                pooler_output=pooled_output,
+                hidden_states=encoder_outputs.hidden_states,
+                attentions=encoder_outputs.attentions,
+            )
+
+
+@dataclass
+@auto_docstring(
+    custom_intro="""
+    Output type of [`AlbertForPreTraining`].
+    """
+)
+class AlbertForPreTrainingOutput(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    prediction_logits: Optional[torch.FloatTensor] = None
+    sop_logits: Optional[torch.FloatTensor] = None
+    hidden_states: Optional[torch.FloatTensor] = None
+    attentions: Optional[torch.FloatTensor] = None
+
+
+@auto_docstring(
+    custom_intro="""
+    Albert Model with two heads on top as done during the pretraining: a `masked language modeling` head and a
+    `sentence order prediction (classification)` head.
+    """
+)
+class AlbertForPreTraining(AlbertPreTrainedModel):
+    _tied_weights_keys = ["predictions.decoder.weight", "predictions.decoder.bias"]
+
+    def __init__(self, config: AlbertConfig):
+        super().__init__(config)
+
+        self.albert = AlbertModel(config)
+        self.predictions = AlbertMLMHead(config)
+        self.sop_classifier = AlbertSOPHead(config)
+
+        self.post_init()
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.albert.get_input_embeddings()
+
+    def get_output_embeddings(self) -> nn.Linear:
+        return self.predictions.decoder
+
+    def set_output_embeddings(self, new_embeddings: nn.Linear) -> None:
+        self.predictions.decoder = new_embeddings
+
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        sequence_order_label: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[AlbertForPreTrainingOutput, tuple]:
+        outputs = self.albert(
+            input_ids,
+            position_ids,
+            token_type_ids,
+            inputs_embeds,
+            attention_mask,
+            head_mask,
+            output_attentions,
+            output_hidden_states,
+            return_dict,
+        )
+        sequence_output, pooled_output = outputs[:2]
+        prediction_scores = self.predictions(sequence_output)
+        sop_scores = self.sop_classifier(pooled_output)
+
+        total_loss = None
+        if labels is not None and sequence_order_label is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
+            sequence_order_loss = loss_fct(sop_scores.view(-1, 2), sequence_order_label.view(-1))
+            total_loss = masked_lm_loss + sequence_order_loss
+
+        if not return_dict:
+            output = (prediction_scores, sop_scores) + outputs[2:]
+            return ((total_loss, ) + output) if total_loss is not None else output
+        else:
+            return AlbertForPreTrainingOutput(
+                loss=total_loss,
+                prediction_logits=prediction_scores,
+                sop_logits=sop_scores,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+
+
 # Questions
-# 1. `head_mask`
+# 1. `head_mask` - mask out specific attention heads without pruning.
 # 2. `past_key_value_length`
+# 2. `add_pooling_layer` - pooling layer is for next sequence prediction task.
