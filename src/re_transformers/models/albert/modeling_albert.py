@@ -8,9 +8,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa
-from transformers.modeling_outputs import BaseModelOutputWithPooling
+from transformers.modeling_outputs import BaseModelOutputWithPooling, MaskedLMOutput
 from transformers.modeling_utils import PreTrainedModel
-from transformers.pytorch_utils import apply_chunking_to_forward, find_pruneable_heads_and_indices, prune_linear_layer
+from transformers.pytorch_utils import (
+    apply_chunking_to_forward,
+    find_pruneable_heads_and_indices,
+    prune_linear_layer,
+)
 from transformers.utils import ModelOutput, auto_docstring, logging
 
 from .configuration_albert import AlbertConfig
@@ -84,12 +88,16 @@ def load_tf_weights_in_albert(model, config, tf_checkpoint_path):
         name = name.replace("group_", "albert_layer_groups/")
 
         # Classifier
-        if len(name.split("/")) == 1 and ("output_bias" in name or "output_weights" in name):
+        if len(name.split("/")) == 1 and (
+            "output_bias" in name or "output_weights" in name
+        ):
             name = "classifier/" + name
 
         # No ALBERT model currently handles the next sentence prediction task
         if "seq_relationship" in name:
-            name = name.replace("seq_relationship/output_", "sop_classifier/classifier/")
+            name = name.replace(
+                "seq_relationship/output_", "sop_classifier/classifier/"
+            )
             name = name.replace("weights", "weight")
 
         name = name.split("/")
@@ -136,7 +144,9 @@ def load_tf_weights_in_albert(model, config, tf_checkpoint_path):
             array = np.transpose(array)
         try:
             if pointer.shape != array.shape:
-                raise ValueError(f"Pointer shape {pointer.shape} and array shape {array.shape} mismatched")
+                raise ValueError(
+                    f"Pointer shape {pointer.shape} and array shape {array.shape} mismatched"
+                )
         except ValueError as e:
             e.args += (pointer.shape, array.shape)
             raise
@@ -150,14 +160,31 @@ class AlbertEmbeddings(nn.Module):
     def __init__(self, config: AlbertConfig) -> None:
         super().__init__()
 
-        self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
-        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand(1, -1), persistent=False)
-        self.register_buffer("token_type_ids", torch.zeros(self.position_ids.size(), dtype=torch.long), persistent=False)
+        self.position_embedding_type = getattr(
+            config, "position_embedding_type", "absolute"
+        )
+        self.register_buffer(
+            "position_ids",
+            torch.arange(config.max_position_embeddings).expand(1, -1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "token_type_ids",
+            torch.zeros(self.position_ids.size(), dtype=torch.long),
+            persistent=False,
+        )
 
-        self.word_embeddings = nn.Embedding(config.vocab_size, config.embedding_size, padding_idx=config.pad_token_id)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.embedding_size)
-        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.embedding_size)
-        self.LayerNorm = nn.LayerNorm(config.embedding_size, eps=config.layer_norm_eps)
+        self.word_embeddings = nn.Embedding(
+            config.vocab_size, config.embedding_size, padding_idx=config.pad_token_id
+        )
+        self.position_embeddings = nn.Embedding(
+            config.max_position_embeddings, config.embedding_size
+        )
+        self.token_type_embeddings = nn.Embedding(
+            config.type_vocab_size, config.embedding_size
+        )
+        self.LayerNorm = nn.LayerNorm(
+            config.embedding_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(
@@ -168,18 +195,27 @@ class AlbertEmbeddings(nn.Module):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         past_key_values_length: int = 0,
     ) -> torch.Tensor:
-        input_shape = input_ids.size() if input_ids is not None else inputs_embeds.size()[:-1]
+        input_shape = (
+            input_ids.size() if input_ids is not None else inputs_embeds.size()[
+                :-1]
+        )
         seq_length = input_shape[1]
 
         if position_ids is None:
-            position_ids = self.position_ids[:, past_key_values_length: seq_length + past_key_values_length]
+            position_ids = self.position_ids[
+                :, past_key_values_length: seq_length + past_key_values_length
+            ]
         if token_type_ids is None:
             if hasattr(self, "token_type_ids"):
                 buffered_token_type_ids = self.token_type_ids[:, :seq_length]
-                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(input_shape[0], seq_length)
+                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(
+                    input_shape[0], seq_length
+                )
                 token_type_ids = buffered_token_type_ids_expanded
             else:
-                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
+                token_type_ids = torch.zeros(
+                    input_shape, dtype=torch.long, device=self.position_ids.device
+                )
 
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
@@ -198,7 +234,9 @@ class AlbertAttention(nn.Module):
     def __init__(self, config: AlbertConfig) -> None:
         super().__init__()
 
-        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
+        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(
+            config, "embedding_size"
+        ):
             raise ValueError(
                 f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
                 f"heads ({config.num_attention_heads}"
@@ -213,13 +251,22 @@ class AlbertAttention(nn.Module):
         self.key = nn.Linear(config.hidden_size, self.all_head_size)
         self.value = nn.Linear(config.hidden_size, self.all_head_size)
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.attention_dropout = nn.Dropout(config.attention_probs_dropout_prob)
+        self.LayerNorm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps)
+        self.attention_dropout = nn.Dropout(
+            config.attention_probs_dropout_prob)
         self.output_dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
-        if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
+        self.position_embedding_type = getattr(
+            config, "position_embedding_type", "absolute"
+        )
+        if (
+            self.position_embedding_type == "relative_key"
+            or self.position_embedding_type == "relative_key_query"
+        ):
             self.max_position_embeddings = config.max_position_embeddings
-            self.distance_embedding = nn.Embedding(2 * self.max_position_embeddings - 1, self.attention_head_size)
+            self.distance_embedding = nn.Embedding(
+                2 * self.max_position_embeddings - 1, self.attention_head_size
+            )
 
         self.pruned_heads = set()
 
@@ -227,7 +274,9 @@ class AlbertAttention(nn.Module):
         if len(heads) == 0:
             return
 
-        heads, index = find_pruneable_heads_and_indices(heads, self.num_attention_heads, self.attention_head_size, self.pruned_heads)
+        heads, index = find_pruneable_heads_and_indices(
+            heads, self.num_attention_heads, self.attention_head_size, self.pruned_heads
+        )
         self.query = prune_linear_layer(self.query, index)
         self.key = prune_linear_layer(self.key, index)
         self.value = prune_linear_layer(self.value, index)
@@ -250,30 +299,58 @@ class AlbertAttention(nn.Module):
         key_layer: torch.Tensor = self.key(hidden_states)
         value_layer: torch.Tensor = self.value(hidden_states)
 
-        query_layer = query_layer.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
-        key_layer = key_layer.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
-        value_layer = value_layer.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+        query_layer = query_layer.view(
+            batch_size, -1, self.num_attention_heads, self.attention_head_size
+        ).transpose(1, 2)
+        key_layer = key_layer.view(
+            batch_size, -1, self.num_attention_heads, self.attention_head_size
+        ).transpose(1, 2)
+        value_layer = value_layer.view(
+            batch_size, -1, self.num_attention_heads, self.attention_head_size
+        ).transpose(1, 2)
 
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        attention_scores = torch.matmul(
+            query_layer, key_layer.transpose(-1, -2))
+        attention_scores = attention_scores / \
+            math.sqrt(self.attention_head_size)
 
         if attention_mask is not None:
             attention_scores = attention_scores + attention_mask
 
-        if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
-            position_ids_l = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(-1, 1)
-            position_ids_r = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(1, -1)
+        if (
+            self.position_embedding_type == "relative_key"
+            or self.position_embedding_type == "relative_key_query"
+        ):
+            position_ids_l = torch.arange(
+                seq_length, dtype=torch.long, device=hidden_states.device
+            ).view(-1, 1)
+            position_ids_r = torch.arange(
+                seq_length, dtype=torch.long, device=hidden_states.device
+            ).view(1, -1)
             distance = position_ids_l - position_ids_r
-            positional_embedding: torch.Tensor = self.distance_embedding(distance + self.max_position_embeddings - 1)
-            positional_embedding = positional_embedding.to(dtype=query_layer.dtype)
+            positional_embedding: torch.Tensor = self.distance_embedding(
+                distance + self.max_position_embeddings - 1
+            )
+            positional_embedding = positional_embedding.to(
+                dtype=query_layer.dtype)
 
             if self.position_embedding_type == "relative_key":
-                relative_position_scores = torch.einsum("bhld,lrd->bhlr", query_layer, positional_embedding)
+                relative_position_scores = torch.einsum(
+                    "bhld,lrd->bhlr", query_layer, positional_embedding
+                )
                 attention_scores = attention_scores + relative_position_scores
             if self.position_embedding_type == "relative_key_query":
-                relative_position_scores_query = torch.einsum("bhld,lrd->bhlr", query_layer, positional_embedding)
-                relative_position_scores_key = torch.einsum("bhrd,lrd->bhlr", key_layer, positional_embedding)
-                attention_scores = attention_scores + relative_position_scores_query + relative_position_scores_key
+                relative_position_scores_query = torch.einsum(
+                    "bhld,lrd->bhlr", query_layer, positional_embedding
+                )
+                relative_position_scores_key = torch.einsum(
+                    "bhrd,lrd->bhlr", key_layer, positional_embedding
+                )
+                attention_scores = (
+                    attention_scores
+                    + relative_position_scores_query
+                    + relative_position_scores_key
+                )
 
         attention_probs = F.softmax(attention_scores, dim=-1)
         attention_probs = self.attention_dropout(attention_probs)
@@ -285,10 +362,17 @@ class AlbertAttention(nn.Module):
         context_layer = context_layer.transpose(1, 2).flatten(2)
 
         projected_context_layer = self.dense(context_layer)
-        projected_context_layer_dropout = self.output_dropout(projected_context_layer)
-        layernormed_context_layer = self.LayerNorm(projected_context_layer_dropout + hidden_states)
+        projected_context_layer_dropout = self.output_dropout(
+            projected_context_layer)
+        layernormed_context_layer = self.LayerNorm(
+            projected_context_layer_dropout + hidden_states
+        )
 
-        return (layernormed_context_layer, attention_probs) if output_attentions else (layernormed_context_layer, )
+        return (
+            (layernormed_context_layer, attention_probs)
+            if output_attentions
+            else (layernormed_context_layer,)
+        )
 
 
 class AlbertSdpaAttention(AlbertAttention):
@@ -305,7 +389,9 @@ class AlbertSdpaAttention(AlbertAttention):
         output_attentions: bool = False,
     ) -> Union[Tuple[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         if self.position_embedding_type != "absolute" or output_attentions:
-            return super().forward(hidden_states, attention_mask, head_mask, output_attentions)
+            return super().forward(
+                hidden_states, attention_mask, head_mask, output_attentions
+            )
 
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -313,9 +399,15 @@ class AlbertSdpaAttention(AlbertAttention):
         key_layer: torch.Tensor = self.key(hidden_states)
         value_layer: torch.Tensor = self.value(hidden_states)
 
-        query_layer = query_layer.view(batch_size, seq_len, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
-        key_layer = key_layer.view(batch_size, seq_len, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
-        value_layer = value_layer.view(batch_size, seq_len, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+        query_layer = query_layer.view(
+            batch_size, seq_len, self.num_attention_heads, self.attention_head_size
+        ).transpose(1, 2)
+        key_layer = key_layer.view(
+            batch_size, seq_len, self.num_attention_heads, self.attention_head_size
+        ).transpose(1, 2)
+        value_layer = value_layer.view(
+            batch_size, seq_len, self.num_attention_heads, self.attention_head_size
+        ).transpose(1, 2)
 
         attention_output = F.scaled_dot_product_attention(
             query_layer,
@@ -329,10 +421,13 @@ class AlbertSdpaAttention(AlbertAttention):
         attention_output = attention_output.transpose(1, 2).flatten(2)
 
         projected_context_layer = self.dense(attention_output)
-        projected_context_layer_dropout = self.output_dropout(projected_context_layer)
-        layernormed_context_layer = self.LayerNorm(hidden_states + projected_context_layer_dropout)
+        projected_context_layer_dropout = self.output_dropout(
+            projected_context_layer)
+        layernormed_context_layer = self.LayerNorm(
+            hidden_states + projected_context_layer_dropout
+        )
 
-        return (layernormed_context_layer, )
+        return (layernormed_context_layer,)
 
 
 ALBERT_ATTENTION_CLASSES = {
@@ -349,11 +444,15 @@ class AlbertLayer(nn.Module):
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
 
-        self.attention = ALBERT_ATTENTION_CLASSES[config._attn_implementation](config)  # type: ignore
+        self.attention = ALBERT_ATTENTION_CLASSES[config._attn_implementation](
+            config)  # type: ignore
         self.ffn = nn.Linear(config.hidden_size, config.intermediate_size)
-        self.ffn_output = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.ffn_output = nn.Linear(
+            config.intermediate_size, config.hidden_size)
         self.activation = ACT2FN[config.hidden_act]
-        self.full_layer_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.full_layer_layer_norm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
 
     def forward(
         self,
@@ -363,15 +462,18 @@ class AlbertLayer(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        attention_output = self.attention(hidden_states, attention_mask, head_mask, output_attentions)
+        attention_output = self.attention(
+            hidden_states, attention_mask, head_mask, output_attentions
+        )
         ffn_output = apply_chunking_to_forward(
             self.ff_chunk,
             self.chunk_size_feed_forward,
             self.seq_len_dim,
             attention_output[0],
         )
-        hidden_states = self.full_layer_layer_norm(ffn_output + attention_output[0])
-        return (hidden_states, ) + attention_output[1:]
+        hidden_states = self.full_layer_layer_norm(
+            ffn_output + attention_output[0])
+        return (hidden_states,) + attention_output[1:]
 
     def ff_chunk(self, attention_output: torch.Tensor) -> torch.Tensor:
         ffn_output = self.ffn(attention_output)
@@ -384,9 +486,9 @@ class AlbertLayerGroup(nn.Module):
     def __init__(self, config: AlbertConfig) -> None:
         super().__init__()
 
-        self.albert_layers = nn.ModuleList([
-            AlbertLayer(config) for _ in range(config.inner_group_num)
-        ])
+        self.albert_layers = nn.ModuleList(
+            [AlbertLayer(config) for _ in range(config.inner_group_num)]
+        )
 
     def forward(
         self,
@@ -409,15 +511,15 @@ class AlbertLayerGroup(nn.Module):
             hidden_states = layer_output[0]
 
             if output_attentions:
-                layer_attentions = layer_attentions + (layer_output[1], )
+                layer_attentions = layer_attentions + (layer_output[1],)
             if output_hidden_states:
-                layer_hidden_states = layer_hidden_states + (hidden_states, )
+                layer_hidden_states = layer_hidden_states + (hidden_states,)
 
-        outputs = (hidden_states, )
+        outputs = (hidden_states,)
         if output_hidden_states:
-            outputs = outputs + (layer_hidden_states, )
+            outputs = outputs + (layer_hidden_states,)
         if output_attentions:
-            outputs = outputs + (layer_attentions, )
+            outputs = outputs + (layer_attentions,)
         return outputs  # type: ignore
 
 
@@ -430,9 +532,9 @@ class AlbertTransformer(nn.Module):
             config.embedding_size,
             config.hidden_size,
         )
-        self.albert_layer_groups = nn.ModuleList([
-            AlbertLayerGroup(config) for _ in range(config.num_hidden_groups)
-        ])
+        self.albert_layer_groups = nn.ModuleList(
+            [AlbertLayerGroup(config) for _ in range(config.num_hidden_groups)]
+        )
 
     def forward(
         self,
@@ -444,25 +546,26 @@ class AlbertTransformer(nn.Module):
         return_dict: bool = True,
     ) -> Union[BaseModelOutput, Tuple]:
         hidden_states = self.embedding_hidden_mapping_in(hidden_states)
-        all_hidden_states = (hidden_states, ) if output_hidden_states else None
+        all_hidden_states = (hidden_states,) if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
-        head_mask = [None] * self.config.num_hidden_layers \
-            if head_mask is None else head_mask  # type: ignore
+        head_mask = (
+            [None] * self.config.num_hidden_layers if head_mask is None else head_mask
+        )  # type: ignore
 
         for i in range(self.config.num_hidden_layers):
             layers_per_group = int(
                 self.config.num_hidden_layers / self.config.num_hidden_groups
             )
-            group_idx = int(i / (
-                self.config.num_hidden_layers / self.config.num_hidden_groups
-            ))
+            group_idx = int(
+                i / (self.config.num_hidden_layers /
+                     self.config.num_hidden_groups)
+            )
             layer_group_output = self.albert_layer_groups[group_idx](
                 hidden_states,
                 attention_mask,
                 head_mask[  # type: ignore
-                    group_idx * layers_per_group:
-                    (group_idx + 1) * layers_per_group
+                    group_idx * layers_per_group: (group_idx + 1) * layers_per_group
                 ],
                 output_attentions,
                 output_hidden_states,
@@ -472,11 +575,13 @@ class AlbertTransformer(nn.Module):
             if output_attentions:
                 all_attentions = all_attentions + layer_group_output[-1]
             if output_hidden_states:
-                all_hidden_states = all_hidden_states + (hidden_states, )  # type: ignore
+                all_hidden_states = all_hidden_states + \
+                    (hidden_states,)  # type: ignore
 
         if not return_dict:
             return tuple(
-                v for v in [hidden_states, all_hidden_states, all_attentions]
+                v
+                for v in [hidden_states, all_hidden_states, all_attentions]
                 if v is not None
             )
         else:
@@ -493,7 +598,8 @@ class AlbertMLMHead(nn.Module):
 
         self.dense = nn.Linear(config.hidden_size, config.embedding_size)
         self.activation = ACT2FN[config.hidden_act]
-        self.LayerNorm = nn.LayerNorm(config.embedding_size, eps=config.layer_norm_eps)
+        self.LayerNorm = nn.LayerNorm(
+            config.embedding_size, eps=config.layer_norm_eps)
         self.decoder = nn.Linear(config.embedding_size, config.vocab_size)
         self.bias = nn.Parameter(torch.zeros(config.vocab_size))
         self.decoder.bias = self.bias
@@ -534,11 +640,13 @@ class AlbertPreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            module.weight.data.normal_(
+                mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            module.weight.data.normal_(
+                mean=0.0, std=self.config.initializer_range)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, nn.LayerNorm):
@@ -561,7 +669,11 @@ class AlbertModel(AlbertPreTrainedModel):
 
         self.embeddings = AlbertEmbeddings(config)
         self.encoder = AlbertTransformer(config)
-        self.pooler = nn.Linear(config.hidden_size, config.hidden_size) if add_pooling_layer else None
+        self.pooler = (
+            nn.Linear(config.hidden_size, config.hidden_size)
+            if add_pooling_layer
+            else None
+        )
         self.pooler_activation = nn.Tanh() if add_pooling_layer else None
 
         self.post_init()
@@ -575,8 +687,11 @@ class AlbertModel(AlbertPreTrainedModel):
     def prune_heads(self, heads_to_prune: dict[int, list[int]]):
         for layer, heads in heads_to_prune.items():
             group_idx = int(layer / self.config.inner_group_num)
-            inner_group_idx = int(layer - group_idx * self.config.inner_group_num)
-            self.encoder.albert_layer_groups[group_idx].albert_layers[inner_group_idx].attention.prune_heads(heads)
+            inner_group_idx = int(layer - group_idx *
+                                  self.config.inner_group_num)
+            self.encoder.albert_layer_groups[group_idx].albert_layers[
+                inner_group_idx
+            ].attention.prune_heads(heads)
 
     def forward(
         self,
@@ -590,25 +705,43 @@ class AlbertModel(AlbertPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[BaseModelOutputWithPooling, tuple]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        return_dict = return_dict if return_dict is not None else self.config.return_dict
+        output_attentions = (
+            output_attentions
+            if output_attentions is not None
+            else self.config.output_attentions
+        )
+        output_hidden_states = (
+            output_hidden_states
+            if output_hidden_states is not None
+            else self.config.output_hidden_states
+        )
+        return_dict = (
+            return_dict if return_dict is not None else self.config.return_dict
+        )
 
         if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time"
+            )
         elif input_ids is not None:
-            self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
+            self.warn_if_padding_and_no_attention_mask(
+                input_ids, attention_mask)
             input_shape = input_ids.size()
         elif inputs_embeds is not None:
             input_shape = inputs_embeds.size()[:-1]
         else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
+            raise ValueError(
+                "You have to specify either input_ids or inputs_embeds")
         _, seq_length = input_shape
 
-        embedding_output = self.embeddings(input_ids, position_ids, token_type_ids, inputs_embeds)
+        embedding_output = self.embeddings(
+            input_ids, position_ids, token_type_ids, inputs_embeds
+        )
 
         if attention_mask is None:
-            attention_mask = torch.ones(input_shape, dtype=self.dtype, device=self.device)
+            attention_mask = torch.ones(
+                input_shape, dtype=self.dtype, device=self.device
+            )
 
         use_sdpa_attention_mask = (
             self.attn_implementation == "sdpa"
@@ -617,12 +750,17 @@ class AlbertModel(AlbertPreTrainedModel):
             and not output_attentions
         )
         if use_sdpa_attention_mask:
-            extended_attention_mask = _prepare_4d_attention_mask_for_sdpa(attention_mask, self.dtype, seq_length)
+            extended_attention_mask = _prepare_4d_attention_mask_for_sdpa(
+                attention_mask, self.dtype, seq_length
+            )
         else:
             extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            extended_attention_mask = (1.0 - extended_attention_mask) * torch.info(self.dtype).min
+            extended_attention_mask = (1.0 - extended_attention_mask) * torch.info(
+                self.dtype
+            ).min
 
-        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+        head_mask = self.get_head_mask(
+            head_mask, self.config.num_hidden_layers)
 
         encoder_outputs = self.encoder(
             embedding_output,
@@ -634,7 +772,11 @@ class AlbertModel(AlbertPreTrainedModel):
         )
 
         sequence_output = encoder_outputs[0]
-        pooled_output = self.pooler_activation(self.pooler(sequence_output[:, 0])) if self.pooler is not None else None
+        pooled_output = (
+            self.pooler_activation(self.pooler(sequence_output[:, 0]))
+            if self.pooler is not None
+            else None
+        )
 
         if not return_dict:
             return (sequence_output, pooled_output) + encoder_outputs[1:]
@@ -668,7 +810,8 @@ class AlbertForPreTrainingOutput(ModelOutput):
     """
 )
 class AlbertForPreTraining(AlbertPreTrainedModel):
-    _tied_weights_keys = ["predictions.decoder.weight", "predictions.decoder.bias"]
+    _tied_weights_keys = [
+        "predictions.decoder.weight", "predictions.decoder.bias"]
 
     def __init__(self, config: AlbertConfig):
         super().__init__(config)
@@ -721,13 +864,18 @@ class AlbertForPreTraining(AlbertPreTrainedModel):
         total_loss = None
         if labels is not None and sequence_order_label is not None:
             loss_fct = nn.CrossEntropyLoss()
-            masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
-            sequence_order_loss = loss_fct(sop_scores.view(-1, 2), sequence_order_label.view(-1))
+            masked_lm_loss = loss_fct(
+                prediction_scores.view(-1,
+                                       self.config.vocab_size), labels.view(-1)
+            )
+            sequence_order_loss = loss_fct(
+                sop_scores.view(-1, 2), sequence_order_label.view(-1)
+            )
             total_loss = masked_lm_loss + sequence_order_loss
 
         if not return_dict:
             output = (prediction_scores, sop_scores) + outputs[2:]
-            return ((total_loss, ) + output) if total_loss is not None else output
+            return ((total_loss,) + output) if total_loss is not None else output
         else:
             return AlbertForPreTrainingOutput(
                 loss=total_loss,
@@ -738,7 +886,60 @@ class AlbertForPreTraining(AlbertPreTrainedModel):
             )
 
 
+@auto_docstring
+class AlbertForMaskedLM(AlbertPreTrainedModel):
+    _tied_weights_keys = [
+        "predictions.decoder.weight", "predictions.decoder.bias"]
+
+    def __init__(self, config: AlbertConfig):
+        super().__init__(config)
+
+        self.albert = AlbertModel(config, add_pooling_layer=False)
+        self.predictions = AlbertMLMHead(config)
+
+        self.post_init()
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.albert.get_input_embeddings()
+
+    def get_output_embeddings(self) -> nn.Linear:
+        return self.predictions.decoder
+
+    def set_output_embeddings(self, new_embeddings: nn.Linear) -> None:
+        self.predictions.decoder = new_embeddings
+        self.predictions.decoder.bias = new_embeddings.bias
+
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[MaskedLMOutput, tuple]:
+        pass
+
+
+__all__ = [
+    "load_tf_weights_in_albert",
+    "AlbertPreTrainedModel",
+    "AlbertModel",
+    "AlbertForPreTraining",
+    "AlbertForMaskedLM",
+    # "AlbertForSequenceClassification",
+    # "AlbertForTokenClassification",
+    # "AlbertForQuestionAnswering",
+    # "AlbertForMultipleChoice",
+]
+
+
 # Questions
 # 1. `head_mask` - mask out specific attention heads without pruning.
 # 2. `past_key_value_length`
-# 2. `add_pooling_layer` - pooling layer is for next sequence prediction task.
+# 3. `add_pooling_layer` - pooling layer is for the next sequence prediction task.
