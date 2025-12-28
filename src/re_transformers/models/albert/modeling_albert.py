@@ -923,7 +923,38 @@ class AlbertForMaskedLM(AlbertPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[MaskedLMOutput, tuple]:
-        pass
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
+
+        outputs = self.albert(
+            input_ids,
+            position_ids,
+            token_type_ids,
+            inputs_embeds,
+            attention_mask,
+            head_mask,
+            output_attentions,
+            output_hidden_states,
+            return_dict,
+        )
+        sequence_outputs = outputs[0]
+        prediction_scores = self.predictions(sequence_outputs)
+
+        masked_lm_loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            masked_lm_loss = loss_fct(
+                prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
+
+        if not return_dict:
+            output = (sequence_outputs, ) + outputs[2:]
+            return ((masked_lm_loss, ) + output) if masked_lm_loss is not None else output
+        else:
+            return MaskedLMOutput(
+                loss=masked_lm_loss,
+                logits=sequence_outputs,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
 
 
 __all__ = [
