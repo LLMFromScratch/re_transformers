@@ -1,4 +1,4 @@
-from .models.albert.modeling_albert import AlbertForMaskedLM
+from .models.albert.modeling_albert import AlbertForMaskedLM, AlbertModel
 
 
-__all__ = ["AlbertForMaskedLM"]
+__all__ = ["AlbertForMaskedLM", "AlbertModel"]
