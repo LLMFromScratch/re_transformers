@@ -10,6 +10,16 @@ authors = [{ name = "Cheng Fei" }]
 readme = "README.md"
 dependencies = ["torch", "numpy"]
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["test"]
+pythonpath = ["src"]
+addopts = ["-ra", "--strict-markers"]
+python_files = ["test_*.py"]
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 
