@@ -20,9 +20,9 @@ class TestModelingAlbert(unittest.TestCase):
         # Base model
         self.name = "albert/albert-base-v2"
         self.model: AlbertModel = AlbertModel.from_pretrained(
-            self.name).to(device=self.device)
+            self.name).to(device=self.device).eval()
         self.re_model: re_AlbertModel = re_AlbertModel.from_pretrained(
-            self.name).to(device=self.device)
+            self.name).to(device=self.device).eval()
 
         # Model config
         self.config = self.model.config
@@ -30,11 +30,11 @@ class TestModelingAlbert(unittest.TestCase):
 
         # Model head
         self.masked_lm_model: AlbertForMaskedLM = AlbertForMaskedLM.from_pretrained(
-            self.name).to(device=self.device)
+            self.name).to(device=self.device).eval()
         self.mlm_head: AlbertMLMHead = self.masked_lm_model.predictions
 
         self.re_masked_lm_model: re_AlbertForMaskedLM = re_AlbertForMaskedLM.from_pretrained(
-            self.name).to(device=self.device)
+            self.name).to(device=self.device).eval()
         self.re_mlm_head: re_AlbertMLMHead = self.re_masked_lm_model.predictions
 
         # Input config
