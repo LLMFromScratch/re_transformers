@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import torch
 import torch.nn as nn
 from transformers import Qwen3Config
@@ -39,6 +41,26 @@ class Qwen3MLP(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.down_proj(self.act_fn(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., :x.size(-1) // 2]
+    x2 = x[..., x.size(-1) // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotaty_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = q * cos + rotate_half(q) * sin
+    k_embed = k * cos + rotate_half(k) * sin
+    return q_embed, k_embed
 
 
 # Questions
