@@ -8,7 +8,13 @@ version = "0.1.0"
 description = "Re-implementation of Transformers from scratch"
 authors = [{ name = "Cheng Fei" }]
 readme = "README.md"
-dependencies = ["torch", "numpy"]
+dependencies = [
+    "kernels>=0.10.2,<0.11",
+    "numpy",
+    "tensorflow",
+    "torch",
+    "transformers",
+]
 
 [project.optional-dependencies]
 dev = ["pytest"]
