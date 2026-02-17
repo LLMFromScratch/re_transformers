@@ -1,16 +1,20 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 from transformers import PreTrainedModel, Qwen3Config
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_layers import GradientCheckpointingLayer
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
+from transformers.modeling_rope_utils import dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs, auto_docstring
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS
@@ -252,6 +256,192 @@ class Qwen3PreTrainedModel(PreTrainedModel):
         "hidden_states": Qwen3DecoderLayer,
         "attentions": Qwen3Attention,
     }
+
+
+class Qwen3RotaryEmbedding(nn.Module):
+    inv_freq: torch.Tensor
+
+    def __init__(self, config: Qwen3Config, device: torch.device = None) -> None:
+        super().__init__()
+
+        self.config = config
+
+        if hasattr(self.config, "rope_scaling") and isinstance(self.config.rope_scaling, dict):
+            self.rope_type = self.config.rope_scaling.get(
+                "rope_type", self.config.rope_scaling.get("type"))
+        else:
+            self.rope_type = "default"
+        rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        inv_freq, self.attention_scale = rope_init_fn(self.config, device)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    @torch.no_grad()
+    @dynamic_rope_update
+    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        inv_freq_expanded = self.inv_freq[None, :, None].expand(
+            position_ids.size(0), -1, 1).to(dtype=torch.float32, device=x.device)
+        position_ids_expanded = position_ids[:, None, :].to(
+            dtype=torch.float32, device=x.device)
+
+        device_type = x.device.type if isinstance(
+            x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @
+                     position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scale
+            sin = emb.sin() * self.attention_scale
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+@auto_docstring
+class Qwen3Model(Qwen3PreTrainedModel):
+    def __init__(self, config: Qwen3Config) -> None:
+        super().__init__(config)
+
+        self.config = config
+        self.padding_idx = self.config.pad_token_id
+        self.vocab_size = self.config.vocab_size
+        self.gradient_checkpointing = False
+        self.has_sliding_layers = "sliding_attention" in self.config.layer_types
+
+        self.embed_tokens = nn.Embedding(
+            self.vocab_size, self.config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList([Qwen3DecoderLayer(
+            self.config, layer_idx=layer_idx) for layer_idx in range(self.config.num_hidden_layers)])
+        self.norm = Qwen3RMSNorm(
+            self.config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
+
+        self.post_init()
+
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPast:
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache(config=self.config)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length(
+            ) if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.size(1), device=inputs_embeds.device)
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        if not isinstance(causal_mask_mapping := attention_mask, dict):
+            mask_kwargs = {
+                "config": self.config,
+                "input_embeds": inputs_embeds,
+                "position_ids": position_ids,
+                "attention_mask": attention_mask,
+                "past_key_values": past_key_values,
+                "cache_position": cache_position,
+            }
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+            }
+
+            if self.has_sliding_layers:
+                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(
+                    **mask_kwargs)
+
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+        hidden_states = self.norm(hidden_states)
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values if use_cache else None,
+        )
+
+
+@auto_docstring
+class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
+    def __init__(self, config: Qwen3Config) -> None:
+        super().__init__(config=config)
+
+        self.vocab_size = config.vocab_size
+
+        self.model = Qwen3Model(config=config)
+        self.lm_head = nn.Linear(
+            config.hidden_size, config.vocab_size, bias=False)
+
+        self.post_init()
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> CausalLMOutputWithPast:
+        outputs: BaseModelOutputWithPast = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
+        )
+        hidden_states = outputs.last_hidden_state
+
+        slice_indices = slice(-logits_to_keep,
+                              None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(
+                logtis=logits, labels=labels, vocab_size=self.vocab_size, **kwargs)
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
 
 # Questions
