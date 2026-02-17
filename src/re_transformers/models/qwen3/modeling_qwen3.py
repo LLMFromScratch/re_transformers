@@ -9,7 +9,12 @@ from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_layers import GradientCheckpointingLayer
+from transformers.modeling_layers import (
+    GenericForQuestionAnswering,
+    GenericForSequenceClassification,
+    GenericForTokenClassification,
+    GradientCheckpointingLayer,
+)
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_rope_utils import dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
@@ -442,6 +447,29 @@ class Qwen3ForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+
+class Qwen3ForSequenceClassification(GenericForSequenceClassification, Qwen3PreTrainedModel):
+    pass
+
+
+class Qwen3ForTokenClassification(GenericForTokenClassification, Qwen3PreTrainedModel):
+    pass
+
+
+class Qwen3ForQuestionAnswering(GenericForQuestionAnswering, Qwen3PreTrainedModel):
+    # For BC, where `transformer` was used instead of `model`
+    base_model_prefix = "transformer"
+
+
+__all__ = [
+    "Qwen3ForCausalLM",
+    "Qwen3ForQuestionAnswering",
+    "Qwen3PreTrainedModel",
+    "Qwen3Model",
+    "Qwen3ForSequenceClassification",
+    "Qwen3ForTokenClassification",
+]
 
 
 # Questions
