@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
 
 class Qwen3_5VisionRotaryEmbedding(nn.Module):
@@ -17,3 +18,10 @@ class Qwen3_5VisionRotaryEmbedding(nn.Module):
                            device=self.inv_freq.device)
         freqs = torch.outer(seq, self.inv_freq)
         return freqs
+
+
+class Qwen3_5TextRotaryEmbedding(nn.Module):
+    inv_freq: torch.Tensor
+
+    def __init__(self, config: Qwen3_5TextConfig, device: torch.device = None) -> None:
+        super().__init__()
